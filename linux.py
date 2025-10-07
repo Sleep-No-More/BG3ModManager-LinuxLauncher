@@ -27,7 +27,7 @@ except ImportError:
 
 user = getpass.getuser()  # getlogin()
 script_path = os.path.abspath(__file__)
-prefix_location = f"/home/{user}/.local/share/wineprefixes/BG3MM/"
+prefix_location = os.path.join(os.path.expanduser("~"), ".local/share/wineprefixes/BG3MM/")
 
 
 class DbgOutput:
@@ -98,9 +98,43 @@ def termbin():
 
 
 def run_command(cmd):
-    print(f"Running {cmd}")
+    """Run a command safely with shell=False.
+    
+    Args:
+        cmd: Either a string (will be split) or a list of command arguments
+    """
+    if isinstance(cmd, str):
+        cmd_list = cmd.split()
+        print(f"Running {cmd}")
+    else:
+        cmd_list = cmd
+        print(f"Running {' '.join(cmd)}")
+    
     result = subprocess.run(
-        cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        cmd_list, shell=False, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    output = result.stdout.decode("utf-8")
+    print(output)
+
+
+def run_wine_command(wine_cmd, *args):
+    """Run a Wine command with the configured prefix and architecture.
+    
+    Args:
+        wine_cmd: The wine command to run (e.g., 'wine', 'winecfg', 'wineboot')
+        *args: Additional arguments for the command
+    """
+    env = os.environ.copy()
+    env['WINEARCH'] = 'win32'
+    env['WINEPREFIX'] = prefix_location
+    
+    cmd = [wine_cmd] + list(args)
+    print(f"Running Wine command: {' '.join(cmd)}")
+    print(f"  WINEARCH=win32 WINEPREFIX={prefix_location}")
+    
+    result = subprocess.run(
+        cmd, env=env, shell=False, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
     output = result.stdout.decode("utf-8")
     print(output)
@@ -116,8 +150,70 @@ def notify(message):
     print(message)
     try:
         subprocess.run(["notify-send", "BG3MM Linux Setup", message], check=False)
-    except (FileNotFoundError, OSError) as e:
+    except OSError as e:
         print(e)
+
+
+def get_wine_prefix_arch(prefix_path):
+    """Detect Wine prefix architecture (win32 or win64).
+    
+    Args:
+        prefix_path: Path to the Wine prefix directory
+    
+    Returns:
+        'win32', 'win64', or None if unable to determine
+    """
+    system_reg_path = os.path.join(prefix_path, "system.reg")
+    if not os.path.exists(system_reg_path):
+        return None
+    
+    try:
+        with open(system_reg_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "WINEARCH" in line:
+                    if "win32" in line:
+                        return "win32"
+                    elif "win64" in line:
+                        return "win64"
+        
+        # Fallback: check for presence of syswow64 (64-bit) or system32 (32-bit only)
+        syswow64_path = os.path.join(prefix_path, "drive_c", "windows", "syswow64")
+        if os.path.exists(syswow64_path):
+            return "win64"
+        else:
+            system32_path = os.path.join(prefix_path, "drive_c", "windows", "system32")
+            if os.path.exists(system32_path):
+                return "win32"
+    except OSError:
+        return None
+    
+    return None
+
+
+def install_wine_component(component_name, component_description):
+    """Install a Wine component using winetricks.
+    
+    Args:
+        component_name: The winetricks package name
+        component_description: Human-readable description for messages
+    """
+    print(f"Installing {component_description} if necessary...")
+    try:
+        env = os.environ.copy()
+        env['WINEARCH'] = 'win32'
+        env['WINEPREFIX'] = prefix_location
+        
+        cmd = ['winetricks', '-q', component_name]
+        print(f"Running: {' '.join(cmd)}")
+        print(f"  WINEARCH=win32 WINEPREFIX={prefix_location}")
+        
+        subprocess.run(
+            cmd, env=env, shell=False, check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: {component_description} installation failed with exit code {e.returncode}")
+        print("Continuing anyway - BG3MM may still work without it...")
 
 
 def setup_wineprefix():
@@ -126,6 +222,7 @@ def setup_wineprefix():
     Changed: Now uses 32-bit Wine prefix (WINEARCH=win32) instead of 64-bit.
     Reason: Better compatibility with .NET Framework and winetricks.
     Added: wineboot -u step to properly initialize the Wine environment.
+    Added: Architecture checking to prevent 32-bit/64-bit conflicts.
     """
     # Create WINEPREFIX if it doesn't exist
     print("Checking if WINEPREFIX exists...")
@@ -137,34 +234,31 @@ def setup_wineprefix():
             "Click 'OK' on the 'Wine configuration' window when it appears to continue..."
         )
         # Using 32-bit Wine prefix for better .NET Framework compatibility
-        run_command(f"WINEARCH=win32 WINEPREFIX={prefix_location} winecfg")
+        run_wine_command("winecfg")
         print("Initializing Wine prefix with wineboot...")
         # wineboot ensures the Wine environment is fully initialized before installing packages
-        run_command(f"WINEARCH=win32 WINEPREFIX={prefix_location} wineboot -u")
+        run_wine_command("wineboot", "-u")
+    else:
+        # Check if existing prefix is 32-bit
+        prefix_arch = get_wine_prefix_arch(prefix_location)
+        if prefix_arch and prefix_arch != "win32":
+            notify(
+                f"WARNING: Existing Wine prefix at {prefix_location} is {prefix_arch}, "
+                "but win32 is required for BG3 Mod Manager. "
+                "Please use --clean flag to remove the existing prefix and create a new 32-bit one."
+            )
+            print(
+                f"ERROR: Wine prefix architecture mismatch. Found {prefix_arch}, required win32."
+            )
+            print("Skipping component installation due to architecture mismatch.")
+            return
+    
     # Try to install .NET Framework 4.7.2 (required for BG3 Mod Manager)
     # Note: This can take 10-20 minutes and may fail on older Wine versions
-    print("Installing dotnet472 if necessary...")
-    try:
-        run_command(
-            f"WINEARCH=win32 WINEPREFIX={prefix_location} winetricks -q dotnet472"
-        )
-    except subprocess.CalledProcessError as e:
-        # Changed: Don't fail the whole setup if dotnet installation fails
-        # The mod manager might still work, or user can install dotnet manually later
-        print(f"Warning: dotnet472 installation failed with exit code {e.returncode}")
-        print("Continuing anyway - BG3MM may still work without it...")
+    install_wine_component("dotnet472", ".NET Framework 4.7.2")
+    
     # Try to install DirectX shader compiler (recommended for better graphics compatibility)
-    print("Installing d3dcompiler_47 if necessary...")
-    try:
-        run_command(
-            f"WINEARCH=win32 WINEPREFIX={prefix_location} winetricks -q d3dcompiler_47"
-        )
-    except subprocess.CalledProcessError as e:
-        # Changed: Also don't fail on d3dcompiler errors
-        print(
-            f"Warning: d3dcompiler_47 installation failed with exit code {e.returncode}"
-        )
-        print("Continuing anyway...")
+    install_wine_component("d3dcompiler_47", "DirectX shader compiler (d3dcompiler_47)")
 
 
 def update_settings():
@@ -172,14 +266,19 @@ def update_settings():
 
     Fixed: Now auto-creates Data directory if it doesn't exist.
     Fixed: Added UTF-8 encoding to all file operations.
+    Fixed: Use os.path.expanduser instead of hardcoded /home/{user}.
     """
     print("Updating settings.json...")
 
     # Wine path format: Z: drive maps to Linux root /
+    # Convert Unix paths to Windows paths for Wine
+    home_path = os.path.expanduser("~")
+    steam_path = os.path.join(home_path, ".steam/steam")
+    
     settings_data = {
-        "GameDataPath": f"Z:\\home\\{user}\\.steam\\steam\\steamapps\\common\\Baldurs Gate 3\\Data",
-        "GameExecutablePath": f"Z:\\home\\{user}\\.steam\\steam\\steamapps\\common\\Baldurs Gate 3\\bin\\bg3.exe",
-        "DocumentsFolderPathOverride": f"Z:\\home\\{user}\\.steam\\steam\\steamapps\\compatdata\\1086940\\pfx\\drive_c\\users\\steamuser\\AppData\\Local\\Larian Studios\\Baldur's Gate 3\\",
+        "GameDataPath": f"Z:{steam_path.replace('/', chr(92))}\\steamapps\\common\\Baldurs Gate 3\\Data",
+        "GameExecutablePath": f"Z:{steam_path.replace('/', chr(92))}\\steamapps\\common\\Baldurs Gate 3\\bin\\bg3.exe",
+        "DocumentsFolderPathOverride": f"Z:{steam_path.replace('/', chr(92))}\\steamapps\\compatdata\\1086940\\pfx\\drive_c\\users\\steamuser\\AppData\\Local\\Larian Studios\\Baldur's Gate 3\\",
     }
 
     settings_path = "Data/settings.json"
@@ -209,6 +308,43 @@ def update_settings():
             json.dump(existing_data, f, indent=2)
 
 
+def load_vdf_or_init(path):
+    """Load a Steam VDF file or return empty shortcuts structure if missing.
+    
+    Args:
+        path: Path to the shortcuts.vdf file
+    
+    Returns:
+        Dictionary with VDF contents or {'shortcuts': {}} if file doesn't exist
+    
+    Raises:
+        ValueError, KeyError, AttributeError: If VDF parsing fails
+    """
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return {"shortcuts": {}}
+    
+    with open(path, "rb") as f:
+        return vdf.binary_loads(f.read())
+
+
+def save_vdf_with_backup(path, data):
+    """Backup existing VDF file and write new data.
+    
+    Args:
+        path: Path to the shortcuts.vdf file
+        data: Dictionary to save as VDF
+    """
+    # Backup BEFORE opening file for writing to prevent data loss
+    if os.path.exists(path):
+        backup_path = f"{path}.bkup"
+        print(f"Backing up {path} to {backup_path}...")
+        shutil.copy(path, backup_path)
+    
+    with open(path, "wb") as f:
+        f.write(vdf.binary_dumps(data))
+
+
 def extract_icon(exe_path, resource_type_id, resource_id_value, output_path):
     """Extract icon from Windows executable for Steam library.
 
@@ -216,7 +352,7 @@ def extract_icon(exe_path, resource_type_id, resource_id_value, output_path):
     """
     try:
         pe = pefile.PE(exe_path)
-    except (FileNotFoundError, OSError, pefile.PEFormatError) as e:
+    except (OSError, pefile.PEFormatError) as e:
         notify(
             f"Couldn't read {exe_path}. `pip install vdf pefile` if you have't already!"
         )
@@ -252,8 +388,10 @@ def extract_icon(exe_path, resource_type_id, resource_id_value, output_path):
 def add_to_steam():
     """Add BG3 Mod Manager to Steam as a non-Steam game.
 
-    Fixed: Now creates shortcuts.vdf if it doesn't exist (was causing FileNotFoundError).
+    Fixed: Now creates shortcuts.vdf if it doesn't exist.
     Fixed: Improved exception handling with specific exception types.
+    Fixed: Backup happens before file write to prevent data loss.
+    Refactored: Uses helper functions for VDF loading and saving.
     """
     # Extract icon from the Windows .exe to use in Steam library
     extract_icon("BG3ModManager.exe", 3, 1, "bg3mm.png")
@@ -263,33 +401,28 @@ def add_to_steam():
     # Find the appropriate user directory (assuming only one user)
     user_dirs = [d for d in os.listdir(steam_dir) if d.isdigit()]
     if not user_dirs:
-        notify("Couldn't find the Steam user directory. Exiting.")
+        notify("Couldn't find the Steam user directory.")
         return
+    
     shortcuts_file = os.path.join(steam_dir, user_dirs[0], "config/shortcuts.vdf")
 
-    # Fixed: Auto-create shortcuts.vdf if it doesn't exist (new Steam installs may not have this)
-    if not os.path.exists(shortcuts_file):
-        print(f"Creating new shortcuts.vdf at {shortcuts_file}")
-        os.makedirs(os.path.dirname(shortcuts_file), exist_ok=True)
-        shortcuts = {"shortcuts": {}}
-    else:
-        with open(shortcuts_file, "rb") as f:
-            try:
-                shortcuts = vdf.binary_loads(f.read())
-            except (ValueError, KeyError, AttributeError) as e:
-                # Fixed: Specific exceptions for VDF parsing errors instead of broad Exception
-                notify(
-                    f"Couldn't read {shortcuts_file}. `pip install vdf pefile` if you have't already!"
-                )
-                print(e)
-                print("Add to Steam failed.")
-                return
+    # Load existing shortcuts or create new structure
+    try:
+        shortcuts = load_vdf_or_init(shortcuts_file)
+    except (ValueError, KeyError, AttributeError) as e:
+        notify(
+            f"Couldn't read {shortcuts_file}. `pip install vdf pefile` if you haven't already!"
+        )
+        print(e)
+        print("Add to Steam failed.")
+        return
 
+    # Create new entry for BG3 Mod Manager
     new_entry = {
         "appname": "BG3 Mod Manager - Linux",
-        "Exe": f"{script_path}",
-        "StartDir": f"{os.path.dirname(script_path)}",
-        "icon": f"{icon_path}",
+        "Exe": script_path,
+        "StartDir": os.path.dirname(script_path),
+        "icon": icon_path,
         "ShortcutPath": "",
         "LaunchOptions": "",
         "IsHidden": False,
@@ -303,13 +436,12 @@ def add_to_steam():
     }
 
     # Add BG3MM to the shortcuts dictionary
-    # The key is the next available index as a string
     try:
-        shortcuts["shortcuts"][str(len(shortcuts["shortcuts"]))] = new_entry
+        idx = str(len(shortcuts["shortcuts"]))
+        shortcuts["shortcuts"][idx] = new_entry
     except (KeyError, TypeError, AttributeError) as e:
-        # Fixed: Specific exceptions for dictionary manipulation errors
         notify(
-            f"Couldn't add {script_path} as 'BG3 Mod Manager - Linux' to Steam as a non-Steam game."
+            f"Couldn't add {script_path} as 'BG3 Mod Manager - Linux' to Steam."
         )
         print(e)
         print("Add to Steam failed.")
@@ -317,15 +449,11 @@ def add_to_steam():
 
     # Save the shortcuts file (Steam will reload it next time it starts)
     try:
-        with open(shortcuts_file, "wb") as f:
-            print(f"Backing up {shortcuts_file} to {shortcuts_file}.bkup...")
-            shutil.copy(shortcuts_file, f"{shortcuts_file}.bkup")
-            f.write(vdf.binary_dumps(shortcuts))
-            notify(
-                f"Added {script_path} as 'BG3 Mod Manager - Linux' to Steam as a non-Steam game."
-            )
-    except (OSError, IOError) as e:
-        # Fixed: Specific exceptions for file I/O errors
+        save_vdf_with_backup(shortcuts_file, shortcuts)
+        notify(
+            f"Added {script_path} as 'BG3 Mod Manager - Linux' to Steam as a non-Steam game."
+        )
+    except OSError as e:
         notify(f"Couldn't save {shortcuts_file}.")
         print(e)
         print("Add to Steam failed.")
@@ -365,8 +493,8 @@ def main():
         try:
             shutil.rmtree(prefix_location)
             notify(f"Removed WINEPREFIX '{prefix_location}'.")
-        except (FileNotFoundError, OSError) as e:
-            # Fixed: Specific exceptions instead of broad Exception
+        except OSError as e:
+            # FileNotFoundError is a subclass of OSError
             notify(f"Couldn't remove WINEPREFIX '{prefix_location}'.")
             print(e)
     if args.setup:
@@ -377,16 +505,14 @@ def main():
     if not args.setup and not args.steam:
         # If no flags provided, just launch the mod manager
         print("Checking if WINEPREFIX exists...")
-        if not os.path.exists(f"{prefix_location}"):
+        if not os.path.exists(prefix_location):
             notify(
                 "WINEPREFIX doesn't exist. Please run with --setup flag to create it."
             )
             termbin()
             return
         # Launch BG3 Mod Manager using the 32-bit Wine prefix
-        run_command(
-            f"WINEARCH=win32 WINEPREFIX={prefix_location} wine BG3ModManager.exe"
-        )
+        run_wine_command("wine", "BG3ModManager.exe")
     termbin()
 
 
